@@ -9,7 +9,6 @@ import hex.glm.GLMModel.GLMParameters;
 import water.DKV;
 import water.Key;
 import water.MemoryManager;
-import water.Scope;
 import water.fvec.Frame;
 import water.fvec.Vec;
 import water.util.ArrayUtils;
@@ -93,6 +92,12 @@ public class GamUtils {
     setParamField(parms, glmParam, true, field2);
     glmParam._train = trainData._key;
     glmParam._valid = valid==null?null:valid._key;
+    glmParam._nfolds = 0; // always set nfolds to 0 to disable cv in GLM.  It is done in GAM
+    glmParam._fold_assignment = Model.Parameters.FoldAssignmentScheme.AUTO;
+    glmParam._keep_cross_validation_fold_assignment = false;
+    glmParam._keep_cross_validation_models = false;
+    glmParam._keep_cross_validation_predictions = false;
+    glmParam._is_cv_model = false; // disable cv in GLM.
     return glmParam;
   }
 
@@ -127,9 +132,9 @@ public class GamUtils {
     return -1;
   }
 
-  public static void copyGLMCoeffs2GAMCoeffs(GAMModel model, GLMModel glm, DataInfo dinfo, GLMParameters.Family family,
+  public static void copyGLMCoeffs2GAMCoeffs(GAMModel model, GLMModel glm, GLMParameters.Family family, 
                                              int gamNumStart, boolean standardized, int nclass) {
-    int numCoeffPerClass = model._output._coefficient_names_no_centering.length;
+    int numCoeffPerClass = model._output._coefficient_names_no_centering.length; // only true for not (multinomial or ordinal)
     if (family.equals(GLMParameters.Family.multinomial) || family.equals(GLMParameters.Family.ordinal)) {
       double[][] model_beta_multinomial = glm._output.get_global_beta_multinomial();
       double[][] standardized_model_beta_multinomial = glm._output.getNormBetaMultinomial();
@@ -150,7 +155,7 @@ public class GamUtils {
   }
 
   
-// This method carries out the evaluation of beta = Z betaCenter as explained in documentation 7.2
+// This method carries out the evaluation of beta = Z*betaCenter as explained in documentation 7.2
   public static double[] convertCenterBeta2Beta(double[][][] ztranspose, int gamNumStart, double[] centerBeta,
                                                 int betaSize) {
     double[] originalBeta = new double[betaSize];

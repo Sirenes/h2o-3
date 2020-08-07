@@ -35,6 +35,7 @@ public class GAMModel extends Model<GAMModel, GAMModel.GAMParameters, GAMModel.G
   public long _nobs;
   public long _nullDOF;
   public int _rank;
+  public IcedHashSet<Key<Frame>> _validKeys = null;
 
   @Override public String[] makeScoringNames() {
     String[] names = super.makeScoringNames();
@@ -217,6 +218,18 @@ public class GAMModel extends Model<GAMModel, GAMModel.GAMParameters, GAMModel.G
     }
   }
 
+  /** Score on an already adapted validation frame during cross validation.  This function is not expected to be called
+   * by other methods.   Returns a MetricBuilder that can be used to make a model metrics.
+   * @param adaptFrm Already adapted frame with gamified columns
+   * @return MetricBuilder
+   */
+  @Override
+  protected ModelMetrics.MetricBuilder scoreMetrics(Frame adaptFrm) {
+    GAMScore gs = makeScoringTask(adaptFrm,false,null, true);
+    assert gs._dinfo._valid:"_valid flag should be set on data info when doing scoring";
+    return gs.doAll(gs._dinfo._adaptedFrame)._mb;
+  }
+
   @SuppressWarnings("WeakerAccess")
   public static class GAMParameters extends Model.Parameters {
     // the following parameters will be passed to GLM algos
@@ -362,9 +375,6 @@ public class GAMModel extends Model<GAMModel, GAMModel.GAMParameters, GAMModel.G
     public TwoDimTable _coefficients_table;
     public TwoDimTable _coefficients_table_no_centering;
     public TwoDimTable _standardized_coefficient_magnitudes;
-    public int _best_lambda_idx; // lambda which minimizes deviance on validation (if provided) or train (if not)
-    public int _lambda_1se = -1; // lambda_best + sd(lambda); only applicable if running lambda search with nfold
-    public int _selected_lambda_idx; // lambda which minimizes deviance on validation (if provided) or train (if not)
     public double[] _model_beta_no_centering; // coefficients generated during model training
     public double[] _standardized_model_beta_no_centering; // standardized coefficients generated during model training
     public double[] _model_beta; // coefficients generated during model training
@@ -373,6 +383,10 @@ public class GAMModel extends Model<GAMModel, GAMModel.GAMParameters, GAMModel.G
     public double[][] _standardized_model_beta_multinomial_no_centering;  // store standardized multinomial coefficients during model training
     public double[][] _model_beta_multinomial;  // store multinomial coefficients during model training
     public double[][] _standardized_model_beta_multinomial;  // store standardized multinomial coefficients during model training
+    public double _best_alpha;
+    public double _best_lambda;
+    public double _devianceValid = Double.NaN;
+    public double _devianceTrain = Double.NaN;
     private double[] _zvalues;
     private double _dispersion;
     private boolean _dispersionEstimated;
@@ -495,11 +509,16 @@ public class GAMModel extends Model<GAMModel, GAMModel.GAMParameters, GAMModel.G
     }
 
     Vec respV = null;
+    Vec weightV = null;
+    if (parms._weights_column != null)  // move weight column to be last column before response column
+      weightV = adptedF.remove(parms._weights_column);
     if (ArrayUtils.contains(testNames, parms._response_column))
       respV = adptedF.remove(parms._response_column);
     adptedF.add(oneAugmentedColumn.names(), oneAugmentedColumn.removeAll());
     Scope.track(oneAugmentedColumn);
-
+    
+    if (weightV != null)
+      adptedF.add(parms._weights_column, weightV);
     if (respV != null)
       adptedF.add(parms._response_column, respV);
     return adptedF;
@@ -510,7 +529,7 @@ public class GAMModel extends Model<GAMModel, GAMModel.GAMParameters, GAMModel.G
                                    CFuncRef customMetricFunc) {
     String[] predictNames = makeScoringNames();
     String[][] domains = new String[predictNames.length][];
-    GAMScore gs = makeScoringTask(adaptFrm, j, computeMetrics);
+    GAMScore gs = makeScoringTask(adaptFrm, true, j, computeMetrics);
     gs.doAll(predictNames.length, Vec.T_NUM, gs._dinfo._adaptedFrame);
     if (gs._computeMetrics)
       gs._mb.makeModelMetrics(this, fr, adaptFrm, gs.outputFrame());
@@ -518,7 +537,7 @@ public class GAMModel extends Model<GAMModel, GAMModel.GAMParameters, GAMModel.G
     return gs.outputFrame(Key.make(destination_key), predictNames, domains);  // place holder
   }
   
-  private GAMScore makeScoringTask(Frame adaptFrm, Job j, boolean computeMetrics) {
+  private GAMScore makeScoringTask(Frame adaptFrm, boolean makePredictions, Job j, boolean computeMetrics) {
     int responseId = adaptFrm.find(_output.responseName());
     if(responseId > -1 && adaptFrm.vec(responseId).isBad()) { // remove inserted invalid response
       adaptFrm = new Frame(adaptFrm.names(),adaptFrm.vecs());
@@ -528,7 +547,8 @@ public class GAMModel extends Model<GAMModel, GAMModel.GAMParameters, GAMModel.G
     String [] domain = _output.nclasses()<=1 ? null : (!detectedComputeMetrics ? _output._domains[_output._domains.length-1] : adaptFrm.lastVec().domain());
     if (_parms._family.equals(Family.quasibinomial))
       domain = _output._responseDomains;
-    return new GAMScore(j, this, _output._dinfo.scoringInfo(_output._names,adaptFrm),domain,detectedComputeMetrics);
+    return new GAMScore(j, this, _output._dinfo.scoringInfo(_output._names,adaptFrm),domain,detectedComputeMetrics, 
+            makePredictions);
   }
 
   private class GAMScore extends MRTask<GAMScore> {
@@ -546,12 +566,14 @@ public class GAMModel extends Model<GAMModel, GAMModel.GAMParameters, GAMModel.G
     private int _lastClass;
     ModelMetrics.MetricBuilder _mb;
     final boolean _sparse;
+    final boolean _generatePredictions;
     private transient double[][] _vcov;
     private transient double[] _tmp;
     private boolean _classifier2class;
 
 
-    private GAMScore(Job j, GAMModel m, DataInfo dinfo, String[] domain, boolean computeMetrics) {
+    private GAMScore(Job j, GAMModel m, DataInfo dinfo, String[] domain, boolean computeMetrics, 
+                     boolean makePredictions) {
       _j = j;
       _m = m;
       _computeMetrics = computeMetrics;
@@ -559,6 +581,7 @@ public class GAMModel extends Model<GAMModel, GAMModel.GAMParameters, GAMModel.G
       _predDomains = domain;
       _m._parms = m._parms;
       _nclass = m._output.nclasses();
+      _generatePredictions = makePredictions;
       _classifier2class = _m._parms._family == GLMModel.GLMParameters.Family.binomial || 
               _m._parms._family == Family.quasibinomial || _m._parms._family == Family.fractionalbinomial;
       if(_m._parms._family == GLMModel.GLMParameters.Family.multinomial ||
@@ -631,11 +654,13 @@ public class GAMModel extends Model<GAMModel, GAMModel.GAMParameters, GAMModel.G
         case ordinal: ps = scoreOrdinalRow(r, r.offset, ps); break;
         default: ps = scoreRow(r, r.offset, ps); break;
       }
-      for (int predCol=0; predCol < ncols; predCol++) { // write prediction to NewChunk
-        preds[predCol].addNum(ps[predCol]);
+      if (_generatePredictions) {
+        for (int predCol = 0; predCol < ncols; predCol++) { // write prediction to NewChunk
+          preds[predCol].addNum(ps[predCol]);
+        }
+        if (_vcov != null)
+          preds[ncols].addNum(Math.sqrt(r.innerProduct(r.mtrxMul(_vcov, _tmp))));
       }
-      if (_vcov != null) 
-        preds[ncols].addNum(Math.sqrt(r.innerProduct(r.mtrxMul(_vcov, _tmp))));
     }
 
     public double[] scoreRow(DataInfo.Row r, double offset, double[] preds) {
@@ -721,6 +746,9 @@ public class GAMModel extends Model<GAMModel, GAMModel.GAMParameters, GAMModel.G
   @Override
   protected Futures remove_impl(Futures fs, boolean cascade) {
     Keyed.remove(_output._gamTransformedTrainCenter, fs, true);
+    if (_validKeys != null)
+      for (Key oneKey:_validKeys)
+        Keyed.remove(oneKey, fs, true);
     super.remove_impl(fs, cascade);
     return fs;
   }
