@@ -856,6 +856,39 @@ class ModelBase(h2o_meta(Keyed)):
         for k, v in viewitems(tm): m[k] = None if v is None else v.gini()
         return list(m.values())[0] if len(m) == 1 else m
 
+    def pr_plot(self, data, train=False, valid=False, xval=False, thresholds=None, plot=True, server=False, 
+                save_to_file=None, figsize=(7, 10)):
+        """
+        Plot the precision recall curve.
+        
+        If all are False (default), then return the training precision recall curve.
+        If more than one options is set to True, an error will be thrown.
+
+        :param data: 
+        :param train: 
+        :param valid: 
+        :param xval: 
+        :param thresholds: 
+        :param plot: 
+        :return: 
+        """
+        if (train and valid) or (valid and xval) or (xval and train):
+            raise H2OValueError("Only one of train, valid and xval can be True.")
+        tm = ModelBase._get_metrics(self, train, valid, xval)
+        for k, v in viewitems(tm): # will only go through this once since only one of train/valid/xval can be true
+            if v is not None and not is_type(v, h2o.model.metrics_base.H2OBinomialModelMetrics):
+                raise H2OValueError("pr_plot is only available for Binomial classifiers.")
+            recall = v["tprs"]
+            fprs = v["fprs"] 
+            # need to get ratio of (number of negative)/(number of positive) in dataset
+            grouped = data.group_by(self.full_parameters["response_column"]["input_value"]["column_name"])
+            grouped.count()
+            result = grouped.get_frame()
+            class0_class1_ratio = result[0,1]/result[1,1] # number of class 0 over number of class 1 ratio
+            precision = [recall[ind]/(recall[ind]+fprs[ind]*class0_class1_ratio) for ind in range(len(recall))]
+    
+
+
     def aucpr(self, train=False, valid=False, xval=False):
         """
         Get the aucPR (Area Under PRECISION RECALL Curve).
@@ -1052,8 +1085,7 @@ class ModelBase(h2o_meta(Keyed)):
 
         else:  # algo is not glm, deeplearning, drf, gbm, xgboost
             raise H2OValueError("Plotting not implemented for this type of model")
-        if not server: plt.show()
-
+        if not server: plt.show()        
 
     def partial_plot(self, data, cols=None, destination_key=None, nbins=20, weight_column=None,
                      plot=True, plot_stddev = True, figsize=(7, 10), server=False, include_na=False, user_splits=None,
@@ -1207,6 +1239,34 @@ class ModelBase(h2o_meta(Keyed)):
             kwargs["user_cols"] = None
             kwargs["user_splits"] = None
             kwargs["num_user_splits"] = None
+
+    def __generate_pr_plot(self, precision, recall, plot, server, save_to_file, figsize):
+        to_fig = 1
+        if plot and to_fig > 0:     # plot 1d pdp for now
+            plt = _get_matplotlib_pyplot(server)
+            cm = _get_matplotlib_cm("Precision-Recall Plots")
+            if not plt:
+                return (precision, recall)  # return a tuple of precision and recall and no plots
+            import matplotlib.gridspec as gridspec
+            fig = plt.figure(figsize=figsize)
+            gxs = gridspec.GridSpec(to_fig, 1)
+
+            fig_plotted = False  # indicated number of figures plotted
+            data_index = 0
+            target = None
+            if targets and len(targets) == 1:
+                target = targets[0]
+            for i in range(to_fig):
+                col = cols[i]
+                fig_plotted = self.__plot_1d_pdp(col, i, data, pps[i], fig, gxs, plot_stddev, row_index, target)
+                data_index = data_index + len(targets)
+            if fig_plotted:
+                fig.tight_layout(pad=0.4, w_pad=0.5, h_pad=1.0)
+            else:
+                print("No precision-recall graph is generated and/or saved.  You may be missing toolboxes like "
+                      "mpl_toolkits.mplot3d or matplotlib.")
+            if (save_to_file is not None) and fig_plotted:  # only save when a figure is actually plotted
+                plt.savefig(save_to_file)
 
     def __generate_partial_plots(self, num_1dpdp, num_2dpdp, plot, server, pps, figsize, col_pairs_2dpdp, data, nbins,
                                  user_cols, user_num_splits, plot_stddev, cols, save_to_file, row_index, targets):
